@@ -29,6 +29,14 @@ const WS_UA = "https://uk.wikisource.org/w/api.php";
 // ================= MIDDLEWARE =================
 app.use(cors());
 app.use(express.json());
+app.get("/", (req, res) => {
+  res.type("text/plain").send("SpeedRead API OK");
+});
+
+app.get("/health", (req, res) => {
+  res.type("text/plain").send("OK");
+});
+
 
 // ================= HELPERS =================
 function safeInt(v, def = 1) {

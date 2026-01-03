@@ -29,6 +29,7 @@ const WS_UA = "https://uk.wikisource.org/w/api.php";
 // ================= MIDDLEWARE =================
 app.use(cors());
 app.use(express.json());
+
 app.get("/", (req, res) => {
   res.type("text/plain").send("SpeedRead API OK");
 });
@@ -36,8 +37,6 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.type("text/plain").send("OK");
 });
-
-
 
 // ================= HELPERS =================
 function safeInt(v, def = 1) {
@@ -67,8 +66,6 @@ function parseId(id) {
 }
 
 function stripHtmlToText(html) {
-  // Очень простой “снятие тегов”: подходит для plain reading.
-  // Если захочешь "премиум очистку" (снос сносок, меню, оглавления) — сделаем 2-й проход.
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -85,10 +82,46 @@ function stripHtmlToText(html) {
     .trim();
 }
 
-// ================= HEALTH =================
-app.get("/health", (req, res) => {
-  res.type("text/plain").send("OK");
-});
+// ----- Content-Disposition (ASCII safe + RFC5987 filename*) -----
+
+// Превращаем имя в ASCII-fallback: только [a-zA-Z0-9._-]
+function asciiFallbackName(name, ext) {
+  const base = (name || "book")
+    .toString()
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "") // убрать всё не-ASCII
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  const safeBase = base.length ? base : "book";
+  const safeExt = ext.startsWith(".") ? ext : `.${ext}`;
+  return `${safeBase}${safeExt}`;
+}
+
+// RFC5987: filename*=UTF-8''<percent-encoded>
+function rfc5987Encode(str) {
+  return encodeURIComponent(str)
+    .replace(/'/g, "%27")
+    .replace(/\(/g, "%28")
+    .replace(/\)/g, "%29")
+    .replace(/\*/g, "%2A");
+}
+
+function setDownloadHeaders(res, filenameUnicode, mime, ext) {
+  const safeExt = ext.startsWith(".") ? ext : `.${ext}`;
+  const fallback = asciiFallbackName(filenameUnicode, safeExt);
+  const encoded = rfc5987Encode(`${filenameUnicode || "book"}${safeExt}`);
+
+  // ВАЖНО: вся строка заголовка — ASCII, поэтому Node не падает
+  const cd =
+    `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+
+  res.setHeader("Content-Type", mime);
+  res.setHeader("Content-Disposition", cd);
+
+  // Иногда полезно для прокси/браузеров
+  res.setHeader("X-Content-Type-Options", "nosniff");
+}
 
 // ================= SEARCH: Gutenberg =================
 async function searchGutenberg(q, page) {
@@ -103,7 +136,6 @@ async function searchGutenberg(q, page) {
     author: (b.authors || []).map((a) => a.name).join(", "),
     lang: (b.languages || [])[0] || "",
     source: "gutenberg",
-    // форматы (для информации)
     formats: Object.keys(b.formats || {}),
   }));
 
@@ -111,8 +143,6 @@ async function searchGutenberg(q, page) {
 }
 
 // ================= SEARCH: Wikisource =================
-// MediaWiki search API:
-// action=query&list=search&srsearch=...&srlimit=...&sroffset=...&format=json&origin=*
 async function searchWikisource(apiUrl, q, page, tag) {
   const limit = 20;
   const offset = (page - 1) * limit;
@@ -132,13 +162,12 @@ async function searchWikisource(apiUrl, q, page, tag) {
   const items = results.map((x) => ({
     id: makeId(tag, x.title),
     title: x.title,
-    author: "",        // у Wikisource автор не всегда в метаданных — можно улучшить позже
+    author: "",
     lang: tag === "wsrc-ua" ? "uk" : "ru",
     source: tag,
     formats: ["text/plain"]
   }));
 
-  // MediaWiki даёт "searchinfo.totalhits"
   const total = data?.query?.searchinfo?.totalhits ?? 0;
   const hasMore = offset + results.length < total;
 
@@ -177,15 +206,30 @@ async function downloadGutenberg(gutenbergId) {
 
   const buffer = Buffer.from(await fileResp.arrayBuffer());
 
+  // Определим “что это” и какое расширение отдавать
+  let outMime = "application/octet-stream";
+  let ext = "bin";
+
+  if (mime.includes("epub")) {
+    outMime = "application/epub+zip";
+    ext = "epub";
+  } else if (mime.includes("text/plain")) {
+    outMime = "text/plain; charset=utf-8";
+    ext = "txt";
+  } else if (mime.includes("text/html")) {
+    outMime = "text/plain; charset=utf-8";
+    ext = "txt";
+  }
+
   return {
     title: book.title || `gutenberg_${gutenbergId}`,
-    mime: mime.includes("text") ? "text/plain" : "application/octet-stream",
+    mime: outMime,
+    ext,
     buffer
   };
 }
 
 // ================= DOWNLOAD: Wikisource =================
-// Мы берём HTML страницы через action=parse&prop=text и превращаем в чистый текст.
 async function downloadWikisource(apiUrl, title, tag) {
   const url =
     `${apiUrl}?action=parse&prop=text` +
@@ -203,7 +247,8 @@ async function downloadWikisource(apiUrl, title, tag) {
 
   return {
     title,
-    mime: "text/plain",
+    mime: "text/plain; charset=utf-8",
+    ext: "txt",
     buffer: Buffer.from(text, "utf-8")
   };
 }
@@ -216,14 +261,12 @@ app.get("/search", async (req, res) => {
 
     if (!q) return res.status(400).json({ error: "Query is empty" });
 
-    // 1) Ищем параллельно в 3 источниках
     const [g, ru, ua] = await Promise.allSettled([
       searchGutenberg(q, page),
       searchWikisource(WS_RU, q, page, "wsrc-ru"),
       searchWikisource(WS_UA, q, page, "wsrc-ua"),
     ]);
 
-    // 2) Собираем результаты, игнорируя источники, которые упали
     const items = [];
     let hasMore = false;
 
@@ -234,13 +277,10 @@ app.get("/search", async (req, res) => {
       }
     }
 
-    // 3) Небольшая “умная” сортировка:
-    // - сначала ru/ua если запрос кириллицей, иначе Gutenberg
-    const hasCyr = /[А-Яа-яЁёІіЇїЄє]/.test(q);
+    const hasCyr = /[А-Яа-яЁёІіЇїЄєҐґ]/.test(q);
     items.sort((a, b) => {
       const w = (x) => {
         if (!hasCyr) return x.source === "gutenberg" ? 0 : 1;
-        // кириллица -> ru/ua выше
         if (x.source === "wsrc-ru") return 0;
         if (x.source === "wsrc-ua") return 0;
         return 2;
@@ -280,11 +320,9 @@ app.get("/download-best", async (req, res) => {
       return res.status(400).json({ error: "Unknown source" });
     }
 
-    res.setHeader("Content-Type", file.mime);
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${file.title.replace(/[^a-z0-9а-яёіїє]/gi, "_")}.txt"`
-    );
+    // ✅ ВАЖНО: заголовок теперь валидный (ASCII) и не валит сервер
+    const title = (file.title || "book").toString();
+    setDownloadHeaders(res, title, file.mime, file.ext);
 
     res.send(file.buffer);
 

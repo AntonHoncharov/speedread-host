@@ -65,26 +65,15 @@ function parseId(id) {
   return null;
 }
 
-function stripHtmlToText(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<\/(p|div|br|h1|h2|h3|li|tr)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#039;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+async function fetchJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Fetch failed: ${r.status} ${r.statusText}`);
+  return await r.json();
 }
 
 // ----- Content-Disposition (ASCII safe + RFC5987 filename*) -----
 
-// Превращаем имя в ASCII-fallback: только [a-zA-Z0-9._-]
+// ASCII fallback: только [a-zA-Z0-9._-]
 function asciiFallbackName(name, ext) {
   const base = (name || "book")
     .toString()
@@ -113,22 +102,17 @@ function setDownloadHeaders(res, filenameUnicode, mime, ext) {
   const encoded = rfc5987Encode(`${filenameUnicode || "book"}${safeExt}`);
 
   // ВАЖНО: вся строка заголовка — ASCII, поэтому Node не падает
-  const cd =
-    `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+  const cd = `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 
   res.setHeader("Content-Type", mime);
   res.setHeader("Content-Disposition", cd);
-
-  // Иногда полезно для прокси/браузеров
   res.setHeader("X-Content-Type-Options", "nosniff");
 }
 
 // ================= SEARCH: Gutenberg =================
 async function searchGutenberg(q, page) {
   const url = `${GUTENDEX}?search=${encodeURIComponent(q)}&page=${page}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error("Gutendex fetch failed");
-  const data = await r.json();
+  const data = await fetchJson(url);
 
   const items = (data.results || []).map((b) => ({
     id: makeId("gutenberg", b.id),
@@ -154,9 +138,7 @@ async function searchWikisource(apiUrl, q, page, tag) {
     `&sroffset=${offset}` +
     `&format=json&origin=*`;
 
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Wikisource ${tag} search failed`);
-  const data = await r.json();
+  const data = await fetchJson(url);
 
   const results = (data?.query?.search || []);
   const items = results.map((x) => ({
@@ -206,7 +188,6 @@ async function downloadGutenberg(gutenbergId) {
 
   const buffer = Buffer.from(await fileResp.arrayBuffer());
 
-  // Определим “что это” и какое расширение отдавать
   let outMime = "application/octet-stream";
   let ext = "bin";
 
@@ -229,24 +210,137 @@ async function downloadGutenberg(gutenbergId) {
   };
 }
 
-// ================= DOWNLOAD: Wikisource =================
-async function downloadWikisource(apiUrl, title, tag) {
+// ================= Wikisource: smart download (plain text + auto-follow) =================
+
+function isBadWikisourceTitle(t) {
+  if (!t) return true;
+  // отсекаем служебные пространства имён
+  const badPrefixes = [
+    "Категория:", "Category:",
+    "Служебная:", "Special:",
+    "Файл:", "File:",
+    "Шаблон:", "Template:",
+    "Обсуждение:", "Talk:",
+    "Портал:", "Portal:",
+    "Викиисточник:", "Wikisource:",
+    "Index:", "Page:",
+    "Автор:", "Author:"
+  ];
+  const s = t.trim();
+  return badPrefixes.some((p) => s.startsWith(p));
+}
+
+function looksLikeIndexOrList(title, text) {
+  const t = (title || "").trim();
+
+  if (isBadWikisourceTitle(t)) return true;
+
+  const x = (text || "").trim();
+  if (!x) return true;
+
+  // короткий текст часто означает "оглавление/указатель"
+  if (x.length < 2000) {
+    // но бывает короткое стихотворение — оставим шанс:
+    // если очень много строк со списками/ссылками — точно индекс
+    const lines = x.split("\n");
+    const listy = lines.filter((l) => /^\s*[\*\-•]/.test(l)).length;
+    if (listy >= 8) return true;
+  }
+
+  // явные маркеры содержания/указателя
+  if (/==\s*(Содержание|Зміст|Contents)\s*==/i.test(x)) return true;
+  if (/Оглавление|Зміст|Содержание/i.test(x) && x.length < 8000) return true;
+
+  // страницы автора/списков
+  if (/Произведения|Твори|Works/i.test(x) && x.length < 12000) return true;
+
+  return false;
+}
+
+async function getWikisourcePlain(apiUrl, title) {
+  // Plain text без HTML-энтити: extracts + explaintext
   const url =
-    `${apiUrl}?action=parse&prop=text` +
-    `&page=${encodeURIComponent(title)}` +
+    `${apiUrl}?action=query&prop=extracts` +
+    `&explaintext=1&exsectionformat=plain` +
+    `&redirects=1` +
+    `&titles=${encodeURIComponent(title)}` +
     `&format=json&origin=*`;
 
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Wikisource ${tag} parse failed`);
-  const data = await r.json();
+  const data = await fetchJson(url);
 
-  const html = data?.parse?.text?.["*"];
-  if (!html) throw new Error("No text on page (maybe redirect/protected)");
+  const pages = data?.query?.pages || {};
+  const page = Object.values(pages)[0];
 
-  const text = stripHtmlToText(html);
+  if (!page || page.missing) throw new Error("Page not found");
+
+  const outTitle = page.title || title;
+  const text = (page.extract || "").trim();
+
+  return { title: outTitle, text };
+}
+
+async function getWikisourceCandidateLinks(apiUrl, title, max = 80) {
+  const url =
+    `${apiUrl}?action=query&prop=links` +
+    `&pllimit=${Math.min(max, 200)}` +
+    `&titles=${encodeURIComponent(title)}` +
+    `&format=json&origin=*`;
+
+  const data = await fetchJson(url);
+  const pages = data?.query?.pages || {};
+  const page = Object.values(pages)[0];
+  const links = page?.links || [];
+  return links.map((l) => l.title).filter(Boolean);
+}
+
+function pickBestLink(currentTitle, links) {
+  const cur = (currentTitle || "").trim();
+  const filtered = links
+    .map((s) => s.trim())
+    .filter((s) => s && s !== cur)
+    .filter((s) => !isBadWikisourceTitle(s));
+
+  if (filtered.length === 0) return null;
+
+  // Простая эвристика:
+  // 1) предпочитаем без двоеточий (обычные страницы)
+  // 2) предпочитаем то, что не похоже на "список"
+  // 3) берем первый
+  const noColon = filtered.filter((s) => !s.includes(":"));
+  return (noColon[0] || filtered[0]) ?? null;
+}
+
+async function downloadWikisourceSmart(apiUrl, title, tag) {
+  // 1) берём plain text текущей страницы
+  let hopTitle = title;
+  let { title: resolvedTitle, text } = await getWikisourcePlain(apiUrl, hopTitle);
+
+  // 2) если это похоже на индекс/список — попробуем перейти по ссылкам на "произведение"
+  // максимум 2 перехода, чтобы не зациклиться
+  for (let hop = 0; hop < 2; hop++) {
+    if (!looksLikeIndexOrList(resolvedTitle, text)) break;
+
+    const links = await getWikisourceCandidateLinks(apiUrl, resolvedTitle, 120);
+    const best = pickBestLink(resolvedTitle, links);
+    if (!best) break;
+
+    hopTitle = best;
+    const next = await getWikisourcePlain(apiUrl, hopTitle);
+
+    // если мы не продвинулись — стоп
+    if (next.title === resolvedTitle) break;
+
+    resolvedTitle = next.title;
+    text = next.text;
+  }
+
+  if (!text || looksLikeIndexOrList(resolvedTitle, text)) {
+    // Важно: лучше честно сказать, чем отдавать "оглавление вместо книги"
+    throw new Error("This looks like an index/list page. Please choose a specific work page.");
+  }
 
   return {
-    title,
+    title: resolvedTitle,
     mime: "text/plain; charset=utf-8",
     ext: "txt",
     buffer: Buffer.from(text, "utf-8")
@@ -277,6 +371,7 @@ app.get("/search", async (req, res) => {
       }
     }
 
+    // лёгкая сортировка: если кириллица — чаще интереснее wsrc-ru/ua
     const hasCyr = /[А-Яа-яЁёІіЇїЄєҐґ]/.test(q);
     items.sort((a, b) => {
       const w = (x) => {
@@ -293,7 +388,6 @@ app.get("/search", async (req, res) => {
       hasMore,
       results: items
     });
-
   } catch (err) {
     res.status(500).json({ error: err.message || "Unknown error" });
   }
@@ -313,19 +407,18 @@ app.get("/download-best", async (req, res) => {
     if (parsed.source === "gutenberg") {
       file = await downloadGutenberg(parsed.value);
     } else if (parsed.source === "wsrc-ru") {
-      file = await downloadWikisource(WS_RU, parsed.value, "wsrc-ru");
+      file = await downloadWikisourceSmart(WS_RU, parsed.value, "wsrc-ru");
     } else if (parsed.source === "wsrc-ua") {
-      file = await downloadWikisource(WS_UA, parsed.value, "wsrc-ua");
+      file = await downloadWikisourceSmart(WS_UA, parsed.value, "wsrc-ua");
     } else {
       return res.status(400).json({ error: "Unknown source" });
     }
 
-    // ✅ ВАЖНО: заголовок теперь валидный (ASCII) и не валит сервер
+    // ✅ заголовки скачивания (без падений на кириллице)
     const title = (file.title || "book").toString();
     setDownloadHeaders(res, title, file.mime, file.ext);
 
     res.send(file.buffer);
-
   } catch (err) {
     res.status(500).json({ error: err.message || "Unknown error" });
   }

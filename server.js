@@ -1,169 +1,147 @@
+/**
+ * SpeedRead Host — Stage 1
+ * Sources:
+ *  ✅ Project Gutenberg (Gutendex)
+ *  ✅ Standard Ebooks (через Gutenberg)
+ *  💤 Internet Archive (disabled, scaffold only)
+ *
+ * Node 18+ (global fetch)
+ */
+
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
 
 const app = express();
+const PORT = process.env.PORT || 8787;
+
+// ================= CONFIG =================
+const GUTENDEX = "https://gutendex.com/books";
+
+// ================= MIDDLEWARE =================
 app.use(cors());
+app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
+// ================= HEALTH =================
+app.get("/health", (_, res) => {
+  res.type("text/plain").send("OK");
+});
 
-/* ===============================
-   SOURCES SWITCHES
-================================ */
-const ENABLE_GUTENBERG = true;
-const ENABLE_STANDARD_EBOOKS = true;
-const ENABLE_INTERNET_ARCHIVE = false; // ⏸ выключен, задел на будущее
-
-/* ===============================
-   HELPERS
-================================ */
-function normalizeText(s) {
-  return s?.replace(/\s+/g, " ").trim() || "";
-}
-
-function makeId(prefix, value) {
-  return `${prefix}:${value}`;
-}
-
-/* ===============================
-   GUTENBERG
-================================ */
-async function searchGutenberg(q) {
-  const url = `https://gutendex.com/books/?search=${encodeURIComponent(q)}`;
-  const res = await fetch(url);
-  const json = await res.json();
-
-  return (json.results || []).map(b => ({
-    id: makeId("gutenberg", b.id),
-    title: normalizeText(b.title),
-    author: normalizeText(b.authors?.[0]?.name || "Unknown author"),
-    downloadUrl:
-      b.formats["application/epub+zip"] ||
-      b.formats["text/plain; charset=utf-8"] ||
-      b.formats["text/plain"]
-  })).filter(b => b.downloadUrl);
-}
-
-async function downloadGutenberg(id) {
-  const bookId = id.split(":")[1];
-  const url = `https://gutendex.com/books/${bookId}`;
-  const res = await fetch(url);
-  const json = await res.json();
-
-  const fileUrl =
-    json.formats["application/epub+zip"] ||
-    json.formats["text/plain; charset=utf-8"] ||
-    json.formats["text/plain"];
-
-  if (!fileUrl) throw new Error("No downloadable file");
-
-  return fetch(fileUrl);
-}
-
-/* ===============================
-   STANDARD EBOOKS
-================================ */
-async function searchStandardEbooks(q) {
-  const indexUrl = "https://standardebooks.org/opds/all";
-  const res = await fetch(indexUrl);
-  const xml = await res.text();
-
-  const regex = /<entry>([\s\S]*?)<\/entry>/g;
-  const results = [];
-
-  let match;
-  while ((match = regex.exec(xml)) !== null) {
-    const entry = match[1];
-
-    const title = entry.match(/<title>(.*?)<\/title>/)?.[1];
-    const author = entry.match(/<name>(.*?)<\/name>/)?.[1];
-    const epub = entry.match(/href="(https:\/\/standardebooks\.org\/ebooks\/[^"]+\.epub)"/)?.[1];
-
-    if (!title || !epub) continue;
-    if (!title.toLowerCase().includes(q.toLowerCase())) continue;
-
-    results.push({
-      id: makeId("se", epub),
-      title: normalizeText(title),
-      author: normalizeText(author || "Unknown author"),
-      downloadUrl: epub
-    });
-  }
-
-  return results;
-}
-
-async function downloadStandardEbooks(id) {
-  const url = id.replace("se:", "");
-  return fetch(url);
-}
-
-/* ===============================
-   INTERNET ARCHIVE (OFF)
-================================ */
-// Заглушка — логика есть, но источник выключен
-async function searchInternetArchive(_) {
-  return [];
-}
-
-/* ===============================
-   SEARCH ENDPOINT
-================================ */
+// ================= SEARCH =================
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.json({ results: [] });
-
-  let results = [];
-
   try {
-    if (ENABLE_GUTENBERG) {
-      results.push(...await searchGutenberg(q));
+    const q = (req.query.q || "").trim();
+    const page = req.query.page || 1;
+
+    if (!q) {
+      return res.status(400).json({ error: "Empty query" });
     }
 
-    if (ENABLE_STANDARD_EBOOKS) {
-      results.push(...await searchStandardEbooks(q));
-    }
+    const url = `${GUTENDEX}?search=${encodeURIComponent(q)}&page=${page}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("Gutendex request failed");
 
-    if (ENABLE_INTERNET_ARCHIVE) {
-      results.push(...await searchInternetArchive(q));
-    }
+    const data = await r.json();
 
-    res.json({ results });
+    const results = data.results.map(b => ({
+      id: b.id,
+      title: b.title,
+      author: (b.authors || []).map(a => a.name).join(", "),
+      lang: (b.languages || [])[0] || "en"
+    }));
+
+    res.json({
+      page,
+      hasMore: Boolean(data.next),
+      results
+    });
+
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/* ===============================
-   DOWNLOAD ENDPOINT
-================================ */
-app.get("/download", async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.status(400).send("Missing id");
-
+// ================= DOWNLOAD =================
+app.get("/download-best", async (req, res) => {
   try {
-    let response;
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: "Missing id" });
 
-    if (id.startsWith("gutenberg:")) {
-      response = await downloadGutenberg(id);
-    } else if (id.startsWith("se:")) {
-      response = await downloadStandardEbooks(id);
-    } else {
-      return res.status(400).send("Unknown source");
+    // 1️⃣ Получаем метаданные книги
+    const metaResp = await fetch(`${GUTENDEX}/${id}`);
+    if (!metaResp.ok) throw new Error("Book metadata not found");
+
+    const book = await metaResp.json();
+    const formats = book.formats || {};
+
+    // 2️⃣ Фильтруем только ПОЛНЫЕ КНИГИ
+    const candidates = [
+      "text/plain; charset=utf-8",
+      "text/plain",
+      "application/epub+zip"
+    ];
+
+    let fileUrl = null;
+    let mime = null;
+
+    for (const c of candidates) {
+      if (formats[c]) {
+        fileUrl = formats[c];
+        mime = c;
+        break;
+      }
     }
 
-    res.setHeader("Content-Type", response.headers.get("content-type") || "application/octet-stream");
-    res.setHeader("Content-Disposition", "attachment");
+    if (!fileUrl) {
+      return res.status(404).json({
+        error: "No full book format found"
+      });
+    }
 
-    response.body.pipe(res);
+    // ❌ отсекаем index/list страницы
+    if (fileUrl.includes("index") || fileUrl.includes("contents")) {
+      return res.status(400).json({
+        error: "Index/list page — not a full book"
+      });
+    }
+
+    // 3️⃣ Скачиваем файл
+    const fileResp = await fetch(fileUrl);
+    if (!fileResp.ok) throw new Error("File download failed");
+
+    const buffer = Buffer.from(await fileResp.arrayBuffer());
+
+    // ❌ Минимальный размер (защита от аннотаций)
+    if (buffer.length < 15_000) {
+      return res.status(400).json({
+        error: "File too small — probably not a full book"
+      });
+    }
+
+    const safeName = book.title
+      .replace(/[^a-z0-9а-яё]/gi, "_")
+      .slice(0, 80);
+
+    res.setHeader(
+      "Content-Type",
+      mime.includes("epub") ? "application/epub+zip" : "text/plain; charset=utf-8"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${safeName}${mime.includes("epub") ? ".epub" : ".txt"}"`
+    );
+
+    res.send(buffer);
+
   } catch (e) {
-    res.status(500).send(e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ===============================
-   START
-================================ */
-app.listen(PORT, () => {
-  console.log(`✅ SpeedReader server running on port ${PORT}`);
+// ================= INTERNET ARCHIVE (DISABLED) =================
+// TODO: later
+// app.get("/ia-search", ...)
+
+// ================= START =================
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ SpeedRead Host running on port ${PORT}`);
 });

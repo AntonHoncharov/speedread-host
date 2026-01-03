@@ -1,357 +1,222 @@
-// server.js
 import express from "express";
 import cors from "cors";
 
 const app = express();
 app.use(cors());
 
-// ----------------------------
-// Config
-// ----------------------------
-const PORT = process.env.PORT || 8787;
+const PORT = process.env.PORT || 10000;
 
-// Sources (Stage 1)
+// ===== Sources toggles =====
 const ENABLE_GUTENBERG = true;
 const ENABLE_STANDARD_EBOOKS = true;
+const ENABLE_INTERNET_ARCHIVE = false; // заложили, но выключили
 
-// Keep in code but disabled for now
-const ENABLE_INTERNET_ARCHIVE = false;
-
-// Standard Ebooks OPDS (best-effort; этот эндпоинт у них реально есть в OPDS-формате)
-const SE_OPDS_SEARCH_URL = "https://standardebooks.org/opds/search";
-
-// ----------------------------
-// Helpers
-// ----------------------------
-function clampInt(v, def, min, max) {
-  const n = Number.parseInt(String(v ?? ""), 10);
-  if (Number.isNaN(n)) return def;
-  return Math.max(min, Math.min(max, n));
+// ===== Helpers =====
+function clampStr(s, max = 200) {
+  s = (s ?? "").toString().trim();
+  if (s.length > max) s = s.slice(0, max);
+  return s;
 }
 
-function safeFilename(name) {
-  const base = String(name || "book")
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+function safeAsciiFilename(name) {
+  // ASCII-only fallback for header "filename="
+  const base = (name || "book")
+    .toString()
+    .replace(/[^\x20-\x7E]/g, "") // remove non-ascii
+    .replace(/[\\/:*?"<>|]+/g, "_")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 120);
-
-  // ASCII-only for Content-Disposition safety
-  const ascii = base
-    .normalize("NFKD")
-    .replace(/[^\x20-\x7E]/g, "")
     .trim();
-
-  return (ascii || "book").replace(/\s+/g, "_");
+  return base.length ? base : "book";
 }
 
-async function fetchText(url) {
-  const r = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "SpeedReadHost/1.0 (+https://example.local)",
-      "Accept": "text/html,application/xml,text/xml;q=0.9,*/*;q=0.8",
-    },
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`HTTP ${r.status} fetching ${url}: ${t.slice(0, 200)}`);
-  }
-  return await r.text();
+function contentDisposition(filenameUtf8) {
+  const fallback = safeAsciiFilename(filenameUtf8);
+  const encoded = encodeURIComponent(filenameUtf8 || fallback);
+  // RFC 5987 + safe fallback
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
-async function fetchBytes(url) {
-  const r = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "SpeedReadHost/1.0 (+https://example.local)",
-      "Accept": "*/*",
-    },
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`HTTP ${r.status} fetching ${url}: ${t.slice(0, 200)}`);
-  }
-  const ab = await r.arrayBuffer();
-  return new Uint8Array(ab);
-}
+function pickBestFormat(formats) {
+  // Prefer EPUB, then plain text
+  const candidates = [
+    "application/epub+zip",
+    "application/x-mobipocket-ebook",
+    "text/plain; charset=utf-8",
+    "text/plain",
+  ];
 
-function toB64Url(str) {
-  return Buffer.from(str, "utf8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-function fromB64Url(b64url) {
-  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
-  return Buffer.from(b64, "base64").toString("utf8");
-}
-
-// Very small XML helper (OPDS/Atom)
-function extractTag(xml, tag) {
-  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
-  const m = xml.match(re);
-  return m ? m[1].trim() : "";
-}
-
-function stripXml(s) {
-  return String(s || "")
-    .replace(/<!\[CDATA\[/g, "")
-    .replace(/\]\]>/g, "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .trim();
-}
-
-function parseOpdsEntries(xml) {
-  const entries = [];
-  const parts = xml.split(/<entry\b[^>]*>/i);
-  for (let i = 1; i < parts.length; i++) {
-    const chunk = parts[i];
-    const entryXml = "<entry>" + chunk;
-
-    const title = stripXml(extractTag(entryXml, "title"));
-    const authorBlock = extractTag(entryXml, "author");
-    const authorName = stripXml(extractTag(authorBlock, "name"));
-
-    // Find best acquisition link:
-    // Prefer text/plain, else epub
-    let textUrl = null;
-    let epubUrl = null;
-
-    const linkRe = /<link\b[^>]*>/gi;
-    let lm;
-    while ((lm = linkRe.exec(entryXml))) {
-      const tag = lm[0];
-      const href = (tag.match(/\bhref="([^"]+)"/i) || [])[1];
-      const type = (tag.match(/\btype="([^"]+)"/i) || [])[1];
-      const rel = (tag.match(/\brel="([^"]+)"/i) || [])[1];
-
-      if (!href) continue;
-
-      // acquisition-ish
-      const isAcq = rel ? rel.includes("opds-spec.org/acquisition") : true;
-
-      if (!isAcq) continue;
-
-      if (type && type.toLowerCase().includes("text/plain")) textUrl = textUrl || href;
-      if (type && type.toLowerCase().includes("application/epub+zip")) epubUrl = epubUrl || href;
-    }
-
-    if (!title) continue;
-
-    entries.push({
-      title,
-      author: authorName || "",
-      textUrl,
-      epubUrl,
-    });
-  }
-  return entries;
-}
-
-// ----------------------------
-// Gutenberg
-// ----------------------------
-async function searchGutenberg(q, page) {
-  // Gutendex supports ?search= & ?page=
-  const url = `https://gutendex.com/books?search=${encodeURIComponent(q)}&page=${page}`;
-  const r = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "SpeedReadHost/1.0",
-      "Accept": "application/json",
-    },
-  });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Gutenberg HTTP ${r.status}: ${t.slice(0, 200)}`);
+  for (const mime of candidates) {
+    const url = formats?.[mime];
+    if (url) return { mime, url };
   }
 
+  // Some Gutenberg entries have "text/plain; charset=us-ascii" etc
+  const key = Object.keys(formats || {}).find((k) => k.startsWith("text/plain"));
+  if (key) return { mime: key, url: formats[key] };
+
+  return null;
+}
+
+function normalizeBook({ id, title, author, lang, source, formats }) {
+  return {
+    id,
+    title: title || "",
+    author: author || "",
+    lang: lang || "",
+    source,
+    formats: formats || [],
+  };
+}
+
+// ===== Gutenberg (Gutendex) =====
+async function searchGutenberg(q) {
+  // Gutendex: https://gutendex.com/
+  const url = `https://gutendex.com/books/?search=${encodeURIComponent(q)}`;
+  const r = await fetch(url, { headers: { "User-Agent": "SpeedRead/1.0" } });
+  if (!r.ok) throw new Error(`Gutenberg search failed: ${r.status}`);
   const data = await r.json();
 
-  const results = [];
-  for (const b of data.results || []) {
+  const results = (data.results || []).slice(0, 30).map((b) => {
     const title = b.title || "";
     const author = (b.authors && b.authors[0] && b.authors[0].name) ? b.authors[0].name : "";
-    const lang = (b.languages && b.languages[0]) ? b.languages[0] : "en";
-
+    const lang = (b.languages && b.languages[0]) ? b.languages[0] : "";
     const formats = b.formats || {};
-    // Prefer plain text
-    const plain =
-      formats["text/plain; charset=utf-8"] ||
-      formats["text/plain; charset=us-ascii"] ||
-      formats["text/plain"] ||
-      null;
-
-    const epub = formats["application/epub+zip"] || null;
-
-    // We expose formats just for client logic; UI can ignore it
-    const fmts = [];
-    if (plain) fmts.push("text/plain");
-    if (epub) fmts.push("application/epub+zip");
-
-    // For download-best we only need the id
-    results.push({
+    const available = Object.keys(formats || {});
+    return normalizeBook({
       id: `gutenberg:${b.id}`,
       title,
       author,
       lang,
-      formats: fmts,
+      source: "gutenberg",
+      formats: available,
     });
-  }
+  });
 
-  return {
-    page,
-    hasMore: Boolean(data.next),
-    results,
-  };
+  return results;
 }
 
-async function gutenbergDownloadBest(idStr) {
-  const id = idStr.replace(/^gutenberg:/i, "");
-  const url = `https://gutendex.com/books/${encodeURIComponent(id)}`;
-  const r = await fetch(url, {
-    headers: {
-      "User-Agent": "SpeedReadHost/1.0",
-      "Accept": "application/json",
-    },
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Gutenberg book HTTP ${r.status}: ${t.slice(0, 200)}`);
-  }
+async function downloadGutenberg(gId) {
+  // gId is numeric Gutenberg book id
+  const url = `https://gutendex.com/books/${encodeURIComponent(gId)}`;
+  const r = await fetch(url, { headers: { "User-Agent": "SpeedRead/1.0" } });
+  if (!r.ok) throw new Error(`Gutenberg book failed: ${r.status}`);
   const b = await r.json();
-  const formats = b.formats || {};
 
-  const plain =
-    formats["text/plain; charset=utf-8"] ||
-    formats["text/plain; charset=us-ascii"] ||
-    formats["text/plain"] ||
-    null;
+  const best = pickBestFormat(b.formats || {});
+  if (!best) throw new Error("No downloadable format found");
 
-  const epub = formats["application/epub+zip"] || null;
+  const fileResp = await fetch(best.url, { headers: { "User-Agent": "SpeedRead/1.0" } });
+  if (!fileResp.ok) throw new Error(`Download failed: ${fileResp.status}`);
 
-  const title = b.title || "book";
+  const bytes = Buffer.from(await fileResp.arrayBuffer());
+  // Extension guess
+  let ext = ".bin";
+  const mimeLower = (best.mime || "").toLowerCase();
+  if (mimeLower.includes("epub")) ext = ".epub";
+  else if (mimeLower.includes("text/plain")) ext = ".txt";
+  else if (mimeLower.includes("mobipocket") || mimeLower.includes("mobi")) ext = ".mobi";
 
-  if (plain) {
-    return { url: plain, filename: safeFilename(title) + ".txt", mime: "text/plain; charset=utf-8" };
-  }
-  if (epub) {
-    return { url: epub, filename: safeFilename(title) + ".epub", mime: "application/epub+zip" };
-  }
-  throw new Error("No downloadable formats found (neither text nor epub).");
-}
-
-// ----------------------------
-// Standard Ebooks (OPDS)
-// ----------------------------
-async function searchStandardEbooks(q, page) {
-  // OPDS search doesn’t always support pagination like Gutenberg; we fake paging by slicing
-  const url = `${SE_OPDS_SEARCH_URL}?query=${encodeURIComponent(q)}`;
-  const xml = await fetchText(url);
-  const entries = parseOpdsEntries(xml);
-
-  // page size
-  const pageSize = 25;
-  const start = (page - 1) * pageSize;
-  const slice = entries.slice(start, start + pageSize);
-
-  const results = slice.map((e) => {
-    // Prefer text/plain. If only epub exists — still return, but formats tell the client what it is.
-    const bestUrl = e.textUrl || e.epubUrl;
-    const bestType = e.textUrl ? "text/plain" : (e.epubUrl ? "application/epub+zip" : "");
-    const id = bestUrl ? `se:${toB64Url(bestUrl)}` : `se:${toB64Url("about:blank")}`;
-
-    return {
-      id,
-      title: e.title,
-      author: e.author,
-      lang: "en",
-      formats: bestType ? [bestType] : [],
-    };
-  });
+  const title = b.title || `gutenberg-${gId}`;
+  const filename = `${title}${ext}`;
 
   return {
-    page,
-    hasMore: start + pageSize < entries.length,
-    results,
+    bytes,
+    contentType: best.mime.split(";")[0] || "application/octet-stream",
+    filename,
   };
 }
 
-async function standardEbooksDownloadBest(idStr) {
-  const payload = idStr.replace(/^se:/i, "");
-  const url = fromB64Url(payload);
+// ===== Standard Ebooks (OPDS feed) =====
+async function searchStandardEbooks(q) {
+  // OPDS: https://standardebooks.org/opds/all?query=...
+  const url = `https://standardebooks.org/opds/all?query=${encodeURIComponent(q)}`;
+  const r = await fetch(url, { headers: { "User-Agent": "SpeedRead/1.0" } });
+  if (!r.ok) throw new Error(`Standard Ebooks search failed: ${r.status}`);
+  const xml = await r.text();
 
-  if (!url || url === "about:blank") {
-    throw new Error("Standard Ebooks: missing download URL.");
+  // Very lightweight parsing (good enough for OPDS)
+  const entries = xml.split("<entry>").slice(1);
+  const results = [];
+
+  for (const e of entries.slice(0, 30)) {
+    const titleMatch = e.match(/<title>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].replace(/&amp;/g, "&").trim() : "";
+
+    const authorMatch = e.match(/<name>([\s\S]*?)<\/name>/i);
+    const author = authorMatch ? authorMatch[1].replace(/&amp;/g, "&").trim() : "";
+
+    // Prefer open-access acquisition (usually epub)
+    const linkMatch =
+      e.match(/<link[^>]*rel="http:\/\/opds-spec\.org\/acquisition\/open-access"[^>]*href="([^"]+)"[^>]*type="([^"]+)"[^>]*\/?>/i) ||
+      e.match(/<link[^>]*href="([^"]+)"[^>]*type="application\/epub\+zip"[^>]*\/?>/i);
+
+    const href = linkMatch ? linkMatch[1] : "";
+    const type = linkMatch ? (linkMatch[2] || "application/epub+zip") : "";
+
+    // ID: use href as stable id
+    if (title && href) {
+      results.push(
+        normalizeBook({
+          id: `standard:${href}`,
+          title,
+          author,
+          lang: "en",
+          source: "standard",
+          formats: [type],
+        })
+      );
+    }
   }
 
-  // We don’t know title here; will just name it "standard_ebook"
-  const isTxt = url.toLowerCase().includes(".txt") || url.toLowerCase().includes("text");
+  return results;
+}
+
+async function downloadStandardEbooks(href) {
+  const fileResp = await fetch(href, { headers: { "User-Agent": "SpeedRead/1.0" } });
+  if (!fileResp.ok) throw new Error(`Download failed: ${fileResp.status}`);
+
+  const bytes = Buffer.from(await fileResp.arrayBuffer());
+
+  // Try to get filename from final URL
+  const finalUrl = fileResp.url || href;
+  const last = finalUrl.split("/").pop() || "standard-ebook.epub";
+  const filename = decodeURIComponent(last);
+
   return {
-    url,
-    filename: isTxt ? "standard_ebook.txt" : "standard_ebook.epub",
-    mime: isTxt ? "text/plain; charset=utf-8" : "application/epub+zip",
+    bytes,
+    contentType: "application/epub+zip",
+    filename: filename.endsWith(".epub") ? filename : `${filename}.epub`,
   };
 }
 
-// ----------------------------
-// Internet Archive (disabled placeholder)
-// ----------------------------
-async function searchInternetArchive(_q, _page) {
-  // placeholder
-  return { page: _page, hasMore: false, results: [] };
+// ===== Internet Archive (placeholder; disabled) =====
+async function searchInternetArchive(_q) {
+  if (!ENABLE_INTERNET_ARCHIVE) return [];
+  return [];
 }
 
-// ----------------------------
-// Routes
-// ----------------------------
+// ===== Routes =====
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/search", async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
-    const page = clampInt(req.query.page, 1, 1, 999);
+    const q = clampStr(req.query.q, 120);
+    if (!q) return res.json({ page: 1, hasMore: false, results: [] });
 
-    if (!q) {
-      return res.json({ page, hasMore: false, results: [] });
-    }
+    const tasks = [];
 
+    if (ENABLE_GUTENBERG) tasks.push(searchGutenberg(q));
+    if (ENABLE_STANDARD_EBOOKS) tasks.push(searchStandardEbooks(q));
+    if (ENABLE_INTERNET_ARCHIVE) tasks.push(searchInternetArchive(q));
+
+    const chunks = await Promise.allSettled(tasks);
     const results = [];
-    let hasMore = false;
 
-    if (ENABLE_GUTENBERG) {
-      const g = await searchGutenberg(q, page);
-      results.push(...g.results);
-      hasMore = hasMore || g.hasMore;
+    for (const c of chunks) {
+      if (c.status === "fulfilled") results.push(...c.value);
     }
 
-    if (ENABLE_STANDARD_EBOOKS) {
-      try {
-        const se = await searchStandardEbooks(q, page);
-        results.push(...se.results);
-        hasMore = hasMore || se.hasMore;
-      } catch (e) {
-        // Don’t fail whole search if SE is temporarily down
-        console.warn("Standard Ebooks search failed:", e?.message || e);
-      }
-    }
-
-    if (ENABLE_INTERNET_ARCHIVE) {
-      const ia = await searchInternetArchive(q, page);
-      results.push(...ia.results);
-      hasMore = hasMore || ia.hasMore;
-    }
-
-    res.json({ page, hasMore, results });
+    res.json({ page: 1, hasMore: false, results });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -359,30 +224,35 @@ app.get("/search", async (req, res) => {
 
 app.get("/download-best", async (req, res) => {
   try {
-    const id = String(req.query.id || "").trim();
+    const id = clampStr(req.query.id, 400);
     if (!id) return res.status(400).send("Missing id");
 
-    let pick;
+    const [source, rest] = id.split(":", 2);
+    let out;
 
-    if (/^gutenberg:/i.test(id)) {
-      pick = await gutenbergDownloadBest(id);
-    } else if (/^se:/i.test(id)) {
-      pick = await standardEbooksDownloadBest(id);
+    if (source === "gutenberg") {
+      out = await downloadGutenberg(rest);
+    } else if (source === "standard") {
+      // rest is URL (href)
+      const href = id.slice("standard:".length);
+      out = await downloadStandardEbooks(href);
+    } else if (source === "archive") {
+      if (!ENABLE_INTERNET_ARCHIVE) {
+        return res.status(400).json({ error: "Internet Archive source is disabled (stage 1)." });
+      }
+      return res.status(400).json({ error: "Internet Archive not implemented yet." });
     } else {
-      return res.status(400).send("Unknown id prefix");
+      return res.status(400).json({ error: "Unknown source" });
     }
 
-    const bytes = await fetchBytes(pick.url);
-
-    res.setHeader("Content-Type", pick.mime);
-    res.setHeader("Content-Disposition", `attachment; filename="${pick.filename}"`);
-    res.status(200).send(Buffer.from(bytes));
+    res.setHeader("Content-Type", out.contentType || "application/octet-stream");
+    res.setHeader("Content-Disposition", contentDisposition(out.filename || "book.bin"));
+    res.send(out.bytes);
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ SpeedRead host running on port ${PORT}`);
+  console.log(`✅ SpeedRead proxy running on port ${PORT}`);
 });
-  
